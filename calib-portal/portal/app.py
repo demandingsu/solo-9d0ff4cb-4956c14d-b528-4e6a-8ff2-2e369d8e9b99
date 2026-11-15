@@ -5,6 +5,7 @@
   none         正常
   drop_submit  保存成功后直接断开 HTTP 响应（模拟"保存成功却断线"）
   query_500    查询接口返回 500（模拟查询失败）
+  slow_detail  记录详情页响应变慢（模拟门户卡顿，用于并发核实演示）
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from starlette.status import HTTP_303_SEE_OTHER, HTTP_500_INTERNAL_SERVER_ERROR
 
 DB_PATH = os.environ.get("PORTAL_DB", "/data/portal.db")
 
-FAULT_MODES = {"none", "drop_submit", "query_500"}
+FAULT_MODES = {"none", "drop_submit", "query_500", "slow_detail"}
 
 app = FastAPI(title="模拟旧门户（校准记录）")
 
@@ -268,9 +269,12 @@ async def create_record(
 @app.get("/records/{record_id}", response_class=HTMLResponse)
 def record_detail(record_id: int, saved: int = 0) -> HTMLResponse:
     with db() as conn:
+        fault = get_fault_mode(conn)
         row = conn.execute(
             "SELECT * FROM records WHERE id = ?", (record_id,)
         ).fetchone()
+    if fault == "slow_detail":
+        time.sleep(4)  # 模拟门户卡顿：详情页缓慢响应
     if row is None:
         return render("记录不存在", '<div class="err">未找到该记录</div>')
     banner = (
@@ -313,7 +317,8 @@ def admin_page() -> HTMLResponse:
       <select name="mode">{opts}</select>
       <button type="submit">应用故障模式</button>
     </form>
-    <p>none=正常；drop_submit=保存后断线；query_500=查询返回500。</p>
+    <p>none=正常；drop_submit=保存后断线；query_500=查询返回500；
+       slow_detail=详情页响应慢 4 秒。</p>
     <h2>当前门户记录（{len(rows)} 条）</h2>
     <table><thead><tr><th>ID</th><th>设备编号</th><th>校准日期</th>
     <th>示值误差</th><th>录入时间</th></tr></thead><tbody>{trs}</tbody></table>

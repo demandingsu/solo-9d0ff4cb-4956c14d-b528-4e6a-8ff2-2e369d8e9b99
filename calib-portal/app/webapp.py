@@ -11,8 +11,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import config, database as db
-from .automation import AutomationRunner, normalize_base_url
+from .automation import AutomationRunner, externalize, normalize_base_url
 from .csvutil import CsvError, parse_csv
+from .verify import detail_mismatches, parse_record_url
 from .worker import Worker
 
 logging.basicConfig(
@@ -201,24 +202,94 @@ def row_retry_query(row_id: int):
 
 @app.post("/api/rows/{row_id}/mark-done")
 def row_mark_done(row_id: int, portal_record_url: str = Form("")):
-    """人工核实后手动记完成，必须提供门户记录链接。"""
+    """人工核实后记完成（先核实，再记完成）。
+
+    安全流程：
+    1. 链接必须指向"该行所属门户"的记录详情页，外站/非详情页一律拒绝；
+    2. 用 Playwright 实际打开该页，核对记录 ID、设备编号、校准日期、
+       示值误差与本行一致；页面不可达或字段不符时保持暂停与原证据；
+    3. 读取门户期间若该行被后台重查或人工处置（revision 变化），
+       即使最终仍是暂停态，也放弃本次核验结果，要求重新核实；
+    4. 全部通过才原子写入 记录 ID + 链接 + 完成状态，持久保存。
+    """
     row = db.get_row(row_id)
     if row is None:
         return JSONResponse({"ok": False, "error": "行不存在"}, 404)
     if row["status"] not in config.PAUSED_STATES:
         return JSONResponse({"ok": False, "error": "仅暂停行可标记"}, 409)
-    url = portal_record_url.strip()
-    if not url.startswith(("http://", "https://")):
-        return JSONResponse(
-            {"ok": False, "error": "请填写可访问的门户记录链接"}, 400
+
+    parsed = parse_record_url(row["portal_url"], portal_record_url)
+    if not parsed.ok:
+        return JSONResponse({"ok": False, "error": parsed.error}, 400)
+
+    # 核实前快照：此后任何对该行的改动（含后台重查、人工处置）
+    # 都会令 revision 递增，第 4 步的原子写入将因此失败。
+    snapshot_rev = row["revision"]
+
+    # 用浏览器打开粘贴的详情页读取实际内容（不调用门户数据接口）。
+    # 本路由运行在线程池中，浏览器调用走专属 runner 线程，
+    # 期间其他行的处理与状态查询不受影响。
+    try:
+        detail = automation.read_record_detail(
+            row["portal_url"], portal_record_url.strip(), f"markdone_r{row_id}"
         )
-    db.update_row(
-        row_id, status=config.DONE_EXISTING,
-        portal_record_url=url,
-        detail=f"人工核实后记完成：{url}",
+    except Exception as exc:  # 浏览器尚未就绪等
+        return JSONResponse(
+            {"ok": False, "error": f"浏览器核实失败，保持暂停：{exc}"},
+            status_code=502,
+        )
+    if not detail.ok:
+        return JSONResponse(
+            {"ok": False,
+             "error": f"门户记录页核实失败，保持暂停：{detail.error}"},
+            status_code=502,
+        )
+
+    problems = detail_mismatches(row, detail, parsed.record_id)
+    if problems:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "门户记录与本行不符，保持暂停："
+                + "；".join(problems),
+            },
+            status_code=409,
+        )
+
+    # 全部核对通过：仅当核实期间该行未被改动才落库
+    url_saved = externalize(portal_record_url.strip(), row["portal_url"])
+    saved = db.update_row_if_revision(
+        row_id,
+        snapshot_rev,
+        status=config.DONE_EXISTING,
+        portal_record_id=detail.record_id,
+        portal_record_url=url_saved,
+        detail=(
+            f"人工核实门户记录（ID {detail.record_id}）与本行"
+            f"设备/日期/示值误差一致，记完成：{url_saved}"
+        ),
     )
+    if not saved:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "核实期间该行已被后台重查或人工处置，"
+                "本次核验结果已作废，请重新核实",
+            },
+            status_code=409,
+        )
+
+    # 若批次内行已全部完结，批次状态收口为 done（其余情况保持原态，
+    # 剩余待处理行仍需人工显式续办）
+    counts = db.batch_counts(row["batch_id"])
+    unfinished = counts["total"] - sum(
+        counts.get(s, 0) for s in config.TERMINAL_STATES
+    )
+    if unfinished == 0:
+        db.set_batch_status(row["batch_id"], config.B_DONE,
+                            note="全部行已完结")
     worker.kick()
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "record_id": detail.record_id})
 
 
 @app.post("/api/rows/{row_id}/ignore")

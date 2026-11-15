@@ -1,4 +1,4 @@
-"""离线单元测试：CSV 解析、数值同值比较、状态分类。
+"""离线单元测试：CSV 解析、数值同值比较、状态分类、核实记完成校验。
 
 运行：python -m pytest tests/ -q   （或直接 python tests/test_logic.py）
 """
@@ -10,7 +10,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import config, database as db
+from app.automation import DetailResult
 from app.csvutil import CsvError, normalize_date, parse_csv, same_error
+from app.verify import detail_mismatches, parse_record_url, portal_aliases
 from app.worker import Worker
 
 
@@ -121,6 +123,134 @@ class PersistenceTests(unittest.TestCase):
         counts = db.batch_counts(bid)
         self.assertEqual(counts["total"], 1)
         self.assertEqual(counts[config.PAUSED_DIFF], 1)
+
+    def test_revision_guard(self):
+        """任何写入都令 revision 递增；条件更新只在快照未变时生效。"""
+        bid = db.create_batch("http://p", "a.csv")
+        rid, _ = db.upsert_row(bid, "http://p", "D1", "2026-11-01", "+1", 2)
+        rev0 = db.get_row(rid)["revision"]
+
+        # 快照后行被改动（模拟核实期间后台重查/人工处置）
+        db.update_row(rid, detail="被改动")
+        rev1 = db.get_row(rid)["revision"]
+        self.assertGreater(rev1, rev0)
+        ok = db.update_row_if_revision(
+            rid, rev0, status=config.DONE_EXISTING, detail="过时核验"
+        )
+        self.assertFalse(ok)
+        self.assertNotEqual(db.get_row(rid)["status"], config.DONE_EXISTING)
+
+        # 快照未变则可写入；即使行最终仍是暂停态，revision 不同也拒绝
+        db.update_row(rid, status=config.PAUSED_QUERY_FAIL)
+        rev2 = db.get_row(rid)["revision"]
+        db.increment_attempt(rid)  # 后台重查先加尝试次数
+        db.update_row(rid, status=config.PAUSED_QUERY_FAIL)  # 又回到暂停态
+        self.assertEqual(
+            db.get_row(rid)["status"], config.PAUSED_QUERY_FAIL
+        )
+        ok = db.update_row_if_revision(
+            rid, rev2, status=config.DONE_EXISTING, detail="过时核验"
+        )
+        self.assertFalse(ok)
+        self.assertEqual(
+            db.get_row(rid)["status"], config.PAUSED_QUERY_FAIL
+        )
+        ok = db.update_row_if_revision(
+            rid, db.get_row(rid)["revision"],
+            status=config.DONE_EXISTING, portal_record_id="7",
+            portal_record_url="http://p/records/7",
+        )
+        self.assertTrue(ok)
+        row = db.get_row(rid)
+        self.assertEqual(row["status"], config.DONE_EXISTING)
+        self.assertEqual(row["portal_record_id"], "7")
+
+
+class MarkDoneVerifyTests(unittest.TestCase):
+    """核实记完成的链接校验与字段核对（不触碰浏览器）。"""
+
+    PORTAL = "http://localhost:8080"
+
+    def setUp(self):
+        self._saved = (config.PORTAL_INTERNAL, config.PORTAL_EXTERNAL)
+        config.PORTAL_INTERNAL = "http://portal:8080"
+        config.PORTAL_EXTERNAL = "http://localhost:8080"
+
+    def tearDown(self):
+        config.PORTAL_INTERNAL, config.PORTAL_EXTERNAL = self._saved
+
+    def _row(self):
+        return {
+            "device_no": "EQ-9002",
+            "cal_date": "2026-11-21",
+            "indication_error": "-0.13",
+        }
+
+    def _detail(self, **kw):
+        base = dict(
+            ok=True, record_id="9", device_no="EQ-9002",
+            cal_date="2026-11-21", indication_error="-0.130",
+        )
+        base.update(kw)
+        return DetailResult(**base)
+
+    def test_parse_record_url_ok(self):
+        for url in (
+            "http://localhost:8080/records/9",
+            "http://localhost:8080/records/9/",
+            "http://localhost:8080/records/9?saved=1",
+            "http://portal:8080/records/9",   # 容器内地址等价
+        ):
+            p = parse_record_url(self.PORTAL, url)
+            self.assertTrue(p.ok, f"{url} 应被接受: {p.error}")
+            self.assertEqual(p.record_id, "9")
+
+    def test_parse_record_url_reject_foreign(self):
+        for url in (
+            "http://example.com/records/9",      # 外站
+            "http://localhost:9999/records/9",   # 端口不符
+            "https://localhost:8080/records/9",  # 协议不符
+            "http://localhost:8080/records",     # 非详情页
+            "http://localhost:8080/admin/records",
+            "http://localhost:8080/records/abc",
+            "javascript:alert(1)",
+            "",
+        ):
+            p = parse_record_url(self.PORTAL, url)
+            self.assertFalse(p.ok, f"{url} 应被拒绝")
+
+    def test_portal_aliases(self):
+        aliases = portal_aliases(self.PORTAL)
+        self.assertIn("http://localhost:8080", aliases)
+        self.assertIn("http://portal:8080", aliases)
+        # 与配置无关的自定义门户只接受自身
+        self.assertEqual(
+            portal_aliases("http://my-portal:9000"),
+            {"http://my-portal:9000"},
+        )
+
+    def test_detail_match(self):
+        self.assertEqual(
+            detail_mismatches(self._row(), self._detail(), "9"), []
+        )
+
+    def test_detail_mismatch_each_field(self):
+        cases = [
+            ("record_id", "10"),          # 页面 ID 与链接 ID 不一致
+            ("device_no", "EQ-1002"),     # 粘贴了别的设备记录
+            ("cal_date", "2026-11-20"),
+            ("indication_error", "+0.05"),
+        ]
+        for field, bad in cases:
+            problems = detail_mismatches(
+                self._row(), self._detail(**{field: bad}), "9"
+            )
+            self.assertTrue(problems, f"{field} 不符应被检出")
+
+    def test_detail_date_format_tolerance(self):
+        # 门户页面日期写法不同但为同一天，视为相符
+        d = self._detail(cal_date="2026/11/21")
+        self.assertEqual(detail_mismatches(self._row(), d, "9"), [])
 
 
 if __name__ == "__main__":

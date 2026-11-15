@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS rows (
     portal_record_id TEXT NOT NULL DEFAULT '',
     screenshot TEXT NOT NULL DEFAULT '',
     attempts INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     UNIQUE(portal_url, device_no, cal_date)
 );
@@ -54,6 +55,16 @@ def init() -> None:
     config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with conn() as c:
         c.executescript(SCHEMA)
+        _migrate(c)
+
+
+def _migrate(c: sqlite3.Connection) -> None:
+    """老库就地升级：rows 表补 revision 乐观锁列。"""
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(rows)")}
+    if "revision" not in cols:
+        c.execute(
+            "ALTER TABLE rows ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager
@@ -161,13 +172,39 @@ def update_row(row_id: int, **fields: Any) -> None:
     cols = ", ".join(f"{k}=?" for k in fields)
     vals = list(fields.values()) + [row_id]
     with conn() as c:
-        c.execute(f"UPDATE rows SET {cols} WHERE id=?", vals)
+        c.execute(
+            f"UPDATE rows SET {cols}, revision=revision+1 WHERE id=?", vals
+        )
+
+
+def update_row_if_revision(
+    row_id: int, expected_revision: int, **fields: Any
+) -> bool:
+    """乐观并发控制：仅当行自快照后未被任何改动时才写入。
+
+    人工核实记完成在读取门户页面期间，若同一行被后台重查或人工处置
+    （任何 update_row / increment_attempt 都会令 revision 递增），
+    本写入将失败并返回 False，调用方必须放弃过时核验结果。
+    """
+    if not fields:
+        return False
+    fields["updated_at"] = now()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [row_id, expected_revision]
+    with conn() as c:
+        cur = c.execute(
+            f"UPDATE rows SET {cols}, revision=revision+1"
+            " WHERE id=? AND revision=?",
+            vals,
+        )
+        return cur.rowcount > 0
 
 
 def increment_attempt(row_id: int) -> None:
     with conn() as c:
         c.execute(
-            "UPDATE rows SET attempts=attempts+1, updated_at=? WHERE id=?",
+            "UPDATE rows SET attempts=attempts+1, revision=revision+1,"
+            " updated_at=? WHERE id=?",
             (now(), row_id),
         )
 

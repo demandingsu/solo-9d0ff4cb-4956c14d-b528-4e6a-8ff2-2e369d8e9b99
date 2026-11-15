@@ -150,7 +150,8 @@ async function refresh() {
       <td>${row.portal_record_url ?
         row.portal_record_url.split("; ").map(u =>
           `<a href="${esc(u)}" target="_blank">门户记录↗</a>`).join("<br>")
-        : '<span class="muted">—</span>'}</td>
+        : '<span class="muted">—</span>'}
+        ${row.portal_record_id ? `<br><span class="muted">ID ${esc(row.portal_record_id)}</span>` : ""}</td>
       <td>${row.attempts}</td>
       <td>${actionCell(row)}</td>
     </tr>`).join("");
@@ -163,11 +164,15 @@ async function ignoreRow(id) {
   await post(`/api/rows/${id}/ignore`, { reason }); refresh();
 }
 async function markDone(id) {
-  const url = prompt("请粘贴人工核实到的门户记录链接（必填）：", "");
+  const url = prompt(
+    "请粘贴人工核实到的【本门户记录详情页】链接（/records/记录ID）。\n" +
+    "系统将用浏览器实际打开该页，核对记录ID、设备编号、校准日期、示值误差，\n" +
+    "全部一致才记完成；链接不属于本门户、页面不可达或字段不符将保持暂停。", "");
   if (!url) return;
   const d = await post(`/api/rows/${id}/mark-done`,
     { portal_record_url: url });
-  if (!d.ok) alert(d.error); refresh();
+  if (!d.ok) alert("核实未通过，行保持暂停：\n" + d.error);
+  refresh();
 }
 async function resubmit(id) {
   if (!confirm("确认人工授权重新提交？系统将先查询、确认无同值记录后才提交。")) return;

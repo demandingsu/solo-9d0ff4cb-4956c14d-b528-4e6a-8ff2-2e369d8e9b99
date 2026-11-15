@@ -54,11 +54,38 @@ class SubmitResult:
     record_url: str = ""
 
 
+@dataclass
+class DetailResult:
+    """门户记录详情页读取结果（人工核实记完成用）。"""
+
+    ok: bool
+    record_id: str = ""
+    device_no: str = ""
+    cal_date: str = ""
+    indication_error: str = ""
+    error: str = ""
+    screenshot: str = ""
+
+
 def normalize_base_url(url: str) -> str:
     parsed = urlparse(url.strip())
     if not parsed.scheme:
         parsed = urlparse("http://" + url.strip())
     return urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+
+def internalize(url: str) -> str:
+    """把用户侧外部门户地址转换成容器内浏览器可访问的地址。
+
+    与 externalize 互为反向：用户在网页上填写/粘贴的是外部地址
+    （如 http://localhost:8080），容器内 Playwright 需走服务名
+    （如 http://portal:8080）。两者配置相同时为恒等映射。
+    """
+    internal_base = normalize_base_url(config.PORTAL_INTERNAL)
+    external_base = normalize_base_url(config.PORTAL_EXTERNAL)
+    if internal_base != external_base and url.startswith(external_base):
+        return internal_base + url[len(external_base):]
+    return url
 
 
 def externalize(internal_url: str, portal_url: str) -> str:
@@ -106,10 +133,11 @@ class PortalAutomation:
 
     def health_check(self, portal_url: str) -> tuple[bool, str]:
         """在创建批次前确认门户可打开。"""
+        target = internalize(portal_url)
         ctx = self.new_context(portal_url)
         page = ctx.new_page()
         try:
-            page.goto(portal_url, wait_until="domcontentloaded",
+            page.goto(target, wait_until="domcontentloaded",
                       timeout=config.PAGE_TIMEOUT_MS)
             page.wait_for_selector("text=旧门户", timeout=5000)
             return True, ""
@@ -121,7 +149,7 @@ class PortalAutomation:
     def new_context(self, portal_url: str) -> BrowserContext:
         assert self._browser is not None
         return self._browser.new_context(
-            base_url=normalize_base_url(portal_url),
+            base_url=normalize_base_url(internalize(portal_url)),
             ignore_https_errors=True,
             viewport={"width": 1280, "height": 900},
             locale="zh-CN",
@@ -277,6 +305,51 @@ class PortalAutomation:
         finally:
             page.close()
 
+    # ---- 记录详情页（人工核实记完成用） -----------------------------------
+    def read_record_detail(
+        self, ctx: BrowserContext, url: str, tag: str
+    ) -> DetailResult:
+        """模拟人工：打开粘贴的门户记录详情页，读取页面上的实际字段。
+
+        页面不可达、不是有效详情页时返回 ok=False，调用方必须保持
+        行的暂停状态与原证据不变。
+        """
+        page = ctx.new_page()
+        try:
+            page.goto(
+                internalize(url),
+                wait_until="domcontentloaded",
+                timeout=config.PAGE_TIMEOUT_MS,
+            )
+            try:
+                page.wait_for_selector("#record-id", timeout=8000)
+            except PlaywrightTimeoutError:
+                shot = self._shoot(page, f"{tag}_nodetail")
+                return DetailResult(
+                    ok=False,
+                    error="打开的页面不是有效的门户记录详情页"
+                    "（记录不存在或已被删除）",
+                    screenshot=shot,
+                )
+            return DetailResult(
+                ok=True,
+                record_id=page.locator("#record-id").inner_text().strip(),
+                device_no=page.locator("#record-device").inner_text().strip(),
+                cal_date=page.locator("#record-date").inner_text().strip(),
+                indication_error=page.locator("#record-error")
+                .inner_text()
+                .strip(),
+            )
+        except (PlaywrightTimeoutError, PlaywrightError) as exc:
+            shot = self._shoot(page, f"{tag}_unreach")
+            return DetailResult(
+                ok=False,
+                error=f"门户记录页不可达：{exc.__class__.__name__}: {exc}",
+                screenshot=shot,
+            )
+        finally:
+            page.close()
+
     # ---- 便捷封装 --------------------------------------------------------
     def open_existing_page(self, ctx: BrowserContext, url: str) -> bool:
         page = ctx.new_page()
@@ -361,6 +434,21 @@ class AutomationRunner:
         return self.call(PortalAutomation.submit_record,
                          ctx, device_no, cal_date, indication_error, tag,
                          timeout=config.PAGE_TIMEOUT_MS / 1000 * 2 + 30)
+
+    def read_record_detail(self, portal_url: str, url: str,
+                           tag: str) -> DetailResult:
+        """打开门户记录详情页并读取字段；自建临时 context 并负责关闭。"""
+        return self.call(_read_record_detail, portal_url, url, tag,
+                         timeout=config.PAGE_TIMEOUT_MS / 1000 + 30)
+
+
+def _read_record_detail(auto: PortalAutomation, portal_url: str,
+                        url: str, tag: str) -> DetailResult:
+    ctx = auto.new_context(portal_url)
+    try:
+        return auto.read_record_detail(ctx, url, tag)
+    finally:
+        ctx.close()
 
 
 def _close_context(_auto: PortalAutomation, ctx: BrowserContext) -> None:
