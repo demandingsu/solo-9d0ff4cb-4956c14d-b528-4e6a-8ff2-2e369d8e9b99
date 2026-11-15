@@ -1,0 +1,41 @@
+services:
+  portal:
+    build:
+      context: .
+      dockerfile: Dockerfile.portal
+    container_name: calib-portal-demo
+    ports:
+      - "8080:8080"
+    volumes:
+      - portal-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    container_name: calib-app
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内 Playwright 访问门户用服务名
+      PORTAL_INTERNAL: http://portal:8080
+      # 用户浏览器点击门户记录链接时使用的地址
+      PORTAL_EXTERNAL: http://localhost:8080
+      HEADLESS: "1"
+      PAGE_TIMEOUT_MS: "20000"
+    volumes:
+      - app-data:/data
+    depends_on:
+      portal:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  app-data:
+  portal-data:

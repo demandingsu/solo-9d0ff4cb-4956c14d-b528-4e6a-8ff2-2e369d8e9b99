@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>校准读数补录助手</title>
+<style>
+:root { --blue:#1a56a8; --grey:#666; --line:#d0d7de; }
+* { box-sizing: border-box; }
+body { font-family: "PingFang SC","Microsoft YaHei",sans-serif;
+       margin:0; background:#f5f7fa; color:#1f2933; }
+header { background:var(--blue); color:#fff; padding:14px 28px; }
+header h1 { margin:0; font-size:20px; }
+main { max-width:1100px; margin:24px auto; padding:0 20px; }
+.card { background:#fff; border:1px solid var(--line); border-radius:8px;
+        padding:20px 24px; margin-bottom:22px; }
+h2 { margin-top:0; font-size:17px; }
+label { display:block; margin:10px 0 4px; font-weight:600; }
+input[type=text],input[type=url],input[type=file] {
+  width:100%; padding:8px 10px; border:1px solid var(--line);
+  border-radius:6px; font-size:14px; }
+button { background:var(--blue); color:#fff; border:0; border-radius:6px;
+         padding:8px 18px; font-size:14px; cursor:pointer; }
+button.secondary { background:#5a6b7d; }
+button.danger { background:#b42318; }
+button:disabled { background:#9aa5b1; cursor:not-allowed; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th,td { border:1px solid var(--line); padding:7px 9px; text-align:left;
+        vertical-align:top; }
+th { background:#eef2f7; }
+a { color:var(--blue); }
+.muted { color:var(--grey); font-size:12px; }
+.tag { display:inline-block; padding:2px 8px; border-radius:10px;
+       font-size:12px; white-space:nowrap; }
+.tag-done { background:#d3f9d8; color:#17612b; }
+.tag-paused { background:#ffe3e3; color:#a8071a; }
+.tag-pending { background:#fff3bf; color:#8a6200; }
+.tag-ignored { background:#e9ecef; color:#666; }
+.tag-running { background:#d0ebff; color:#1864ab; }
+#msg { margin-top:10px; font-size:13px; }
+.err { color:#b42318; } .ok { color:#17612b; }
+.pill { font-size:12px; padding:2px 10px; border-radius:10px; }
+.pill-running { background:#d0ebff;color:#1864ab; }
+.pill-paused { background:#ffe3e3;color:#a8071a; }
+.pill-done { background:#d3f9d8;color:#17612b; }
+</style>
+</head>
+<body>
+<header><h1>校准读数补录助手（FastAPI + Playwright + SQLite）</h1></header>
+<main>
+  <div class="card">
+    <h2>新建填报批次</h2>
+    <form id="upload-form">
+      <label for="portal_url">门户地址（浏览器将通过该地址操作表单与查询页）</label>
+      <input type="url" id="portal_url" name="portal_url" required
+             placeholder="例如 http://localhost:8080"
+             value="{{ portal_external }}">
+      <label for="file">CSV 文件（须含列：设备编号、校准日期、示值误差）</label>
+      <input type="file" id="file" name="file" accept=".csv" required>
+      <p class="muted">同一（门户 + 设备编号 + 校准日期）的行进度持久保存，
+        重复上传将自动续办而不重复填报。</p>
+      <button type="submit">上传并开始填报</button>
+      <span id="msg"></span>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>填报批次</h2>
+    {% if not batches %}
+    <p class="muted">暂无批次。可先到
+      <a href="{{ portal_external }}/records/new" target="_blank">模拟门户</a>
+      查看，或用 data/sample.csv 开始演示。</p>
+    {% else %}
+    <table>
+      <thead><tr><th>#</th><th>门户</th><th>CSV</th><th>状态</th>
+        <th>备注</th><th>创建时间</th><th></th></tr></thead>
+      <tbody>
+      {% for b in batches %}
+      <tr>
+        <td>{{ b.id }}</td>
+        <td class="muted">{{ b.portal_url }}</td>
+        <td>{{ b.filename }}</td>
+        <td><span class="pill pill-{{ b.status }}">{{ b.status }}</span></td>
+        <td class="muted">{{ b.note }}</td>
+        <td class="muted">{{ b.created_at }}</td>
+        <td><a href="/batches/{{ b.id }}">查看逐行状态 →</a></td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</main>
+<script>
+document.getElementById("upload-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById("msg");
+  msg.className = "muted"; msg.textContent = "上传中，正在用浏览器校验门户…";
+  const fd = new FormData();
+  fd.append("portal_url", document.getElementById("portal_url").value);
+  fd.append("file", document.getElementById("file").files[0]);
+  const resp = await fetch("/api/batches", { method: "POST", body: fd });
+  const data = await resp.json();
+  if (!data.ok) {
+    msg.className = "err"; msg.textContent = "失败：" + data.error;
+    return;
+  }
+  msg.className = "ok";
+  msg.textContent = "已创建批次 #" + data.batch_id + "，共 " + data.rows +
+    " 行" + (data.notes.length ? "（" + data.notes.join("；") + "）" : "");
+  setTimeout(() => location.href = data.redirect, 800);
+});
+</script>
+</body>
+</html>

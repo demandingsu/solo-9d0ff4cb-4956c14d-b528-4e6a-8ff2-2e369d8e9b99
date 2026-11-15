@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>批次 #{{ batch.id }} 逐行状态</title>
+<style>
+:root { --blue:#1a56a8; --line:#d0d7de; }
+body { font-family:"PingFang SC","Microsoft YaHei",sans-serif;
+       margin:0; background:#f5f7fa; color:#1f2933; }
+header { background:var(--blue); color:#fff; padding:14px 28px; }
+header a { color:#cfe2ff; margin-right:16px; font-size:13px; }
+main { max-width:1280px; margin:22px auto; padding:0 20px; }
+.card { background:#fff; border:1px solid var(--line); border-radius:8px;
+        padding:18px 22px; margin-bottom:20px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th,td { border:1px solid var(--line); padding:7px 9px;
+        text-align:left; vertical-align:top; }
+th { background:#eef2f7; white-space:nowrap; }
+.tag { display:inline-block; padding:2px 8px; border-radius:10px;
+       font-size:12px; white-space:nowrap; }
+.tag-done { background:#d3f9d8; color:#17612b; }
+.tag-paused { background:#ffe3e3; color:#a8071a; }
+.tag-pending { background:#fff3bf; color:#8a6200; }
+.tag-ignored { background:#e9ecef; color:#666; }
+.tag-querying { background:#d0ebff; color:#1864ab; }
+.pill { font-size:12px; padding:2px 10px; border-radius:10px; }
+.pill-running { background:#d0ebff;color:#1864ab; }
+.pill-paused { background:#ffe3e3;color:#a8071a; }
+.pill-done { background:#d3f9d8;color:#17612b; }
+button { border:0; border-radius:6px; padding:5px 12px; font-size:12px;
+         cursor:pointer; margin:2px 4px 2px 0; }
+button.primary { background:var(--blue); color:#fff; }
+button.secondary { background:#5a6b7d; color:#fff; }
+button.danger { background:#b42318; color:#fff; }
+button:disabled { background:#9aa5b1; cursor:not-allowed; }
+.detail { color:#555; font-size:12px; max-width:340px; word-break:break-all; }
+.muted { color:#777; font-size:12px; }
+input[type=url],input[type=text] { width:260px; padding:5px 8px;
+  border:1px solid var(--line); border-radius:5px; font-size:12px; }
+.summary span { display:inline-block; margin-right:14px; font-size:13px; }
+.spin { display:inline-block; width:12px; height:12px; border:2px solid #bcd;
+  border-top-color:transparent; border-radius:50%;
+  animation:rot 0.9s linear infinite; vertical-align:middle; }
+@keyframes rot { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <strong>批次 #{{ batch.id }}</strong>
+  <a href="/">← 返回批次列表</a>
+  <a href="{{ batch.portal_url }}/records" target="_blank">打开门户查询页</a>
+  <a href="{{ batch.portal_url }}/admin/records" target="_blank">门户管理后台（故障注入）</a>
+</header>
+<main>
+  <div class="card">
+    <strong>门户：</strong><span class="muted">{{ batch.portal_url }}</span>
+    <strong>CSV：</strong>{{ batch.filename }}
+    <strong>状态：</strong>
+    <span id="batch-status" class="pill pill-{{ batch.status }}">{{ batch.status }}</span>
+    <span id="spin" class="spin" style="display:none"></span>
+    <p class="muted" id="batch-note">{{ batch.note }}</p>
+    <div class="summary" id="summary"></div>
+    <p class="muted">
+      规则：每行先查门户，唯一同值才跳过；提交后复核确认；断线/重启恢复只查询不重提；
+      查询失败、多条、异值一律暂停且不覆盖门户原记录。
+    </p>
+    <button class="primary" id="btn-resume">续办批次（仅处理待处理行）</button>
+    <span class="muted">暂停行请在下表逐行人工处理</span>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>CSV行</th><th>设备编号</th><th>校准日期</th><th>示值误差</th>
+        <th>状态</th><th>说明</th><th>门户记录</th><th>尝试</th>
+        <th style="min-width:280px">人工操作</th>
+      </tr></thead>
+      <tbody id="rows-body"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const BATCH_ID = {{ batch.id }};
+const PAUSED = {{ paused_states | tojson }};
+const DONE = {{ done_states | tojson }};
+const LABELS = {{ labels | tojson }};
+
+function tagClass(s) {
+  if (DONE.includes(s)) return "tag-done";
+  if (PAUSED.includes(s)) return "tag-paused";
+  if (s === "ignored") return "tag-ignored";
+  if (s === "querying") return "tag-querying";
+  return "tag-pending";
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+async function post(url, form) {
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(form || {})) fd.append(k, v);
+  const r = await fetch(url, { method: "POST", body: fd });
+  return r.json();
+}
+
+function actionCell(row) {
+  const s = row.status;
+  let html = "";
+  if (PAUSED.includes(s)) {
+    html += `<button class="secondary" onclick="retryQuery(${row.id})">重新查询（只查不提）</button>`;
+    html += `<button class="primary" onclick="markDone(${row.id})">核实后记完成</button>`;
+    if (["paused_no_record","paused_submit_fail","paused_query_fail"].includes(s))
+      html += `<button class="danger" onclick="resubmit(${row.id})">授权重提</button>`;
+    html += `<button class="secondary" onclick="ignoreRow(${row.id})">忽略</button>`;
+  } else if (s === "pending" || s === "querying") {
+    html += `<button class="secondary" onclick="ignoreRow(${row.id})">忽略</button>`;
+  } else {
+    html = `<span class="muted">—</span>`;
+  }
+  return html;
+}
+
+async function refresh() {
+  const r = await fetch(`/api/batches/${BATCH_ID}/rows`);
+  const data = await r.json();
+  document.getElementById("batch-status").textContent = data.batch.status;
+  document.getElementById("batch-status").className =
+    "pill pill-" + data.batch.status;
+  document.getElementById("batch-note").textContent = data.batch.note || "";
+  const busy = data.rows.some(x => x.status === "querying") ||
+               data.batch.status === "running";
+  document.getElementById("spin").style.display = busy ? "inline-block" : "none";
+  document.getElementById("summary").innerHTML = Object.entries(data.counts)
+    .filter(([k]) => k !== "total")
+    .map(([k, v]) => `<span>${LABELS[k] || k}: <strong>${v}</strong></span>`)
+    .join("") + `<span>合计: <strong>${data.counts.total}</strong></span>`;
+
+  document.getElementById("rows-body").innerHTML = data.rows.map(row => `
+    <tr>
+      <td>${row.line_no}</td>
+      <td>${esc(row.device_no)}</td>
+      <td>${esc(row.cal_date)}</td>
+      <td>${esc(row.indication_error)}</td>
+      <td><span class="tag ${tagClass(row.status)}">${LABELS[row.status] || row.status}</span></td>
+      <td class="detail">${esc(row.detail)}
+        ${row.screenshot ? `<br><a href="${row.screenshot}" target="_blank">📷 浏览器截图</a>` : ""}
+      </td>
+      <td>${row.portal_record_url ?
+        row.portal_record_url.split("; ").map(u =>
+          `<a href="${esc(u)}" target="_blank">门户记录↗</a>`).join("<br>")
+        : '<span class="muted">—</span>'}</td>
+      <td>${row.attempts}</td>
+      <td>${actionCell(row)}</td>
+    </tr>`).join("");
+}
+
+async function retryQuery(id) { await post(`/api/rows/${id}/retry-query`); refresh(); }
+async function ignoreRow(id) {
+  const reason = prompt("忽略原因（可选）：", "");
+  if (reason === null) return;
+  await post(`/api/rows/${id}/ignore`, { reason }); refresh();
+}
+async function markDone(id) {
+  const url = prompt("请粘贴人工核实到的门户记录链接（必填）：", "");
+  if (!url) return;
+  const d = await post(`/api/rows/${id}/mark-done`,
+    { portal_record_url: url });
+  if (!d.ok) alert(d.error); refresh();
+}
+async function resubmit(id) {
+  if (!confirm("确认人工授权重新提交？系统将先查询、确认无同值记录后才提交。")) return;
+  const d = await post(`/api/rows/${id}/resubmit`);
+  if (!d.ok) alert(d.error); refresh();
+}
+document.getElementById("btn-resume").onclick = async () => {
+  await post(`/api/batches/${BATCH_ID}/resume`); refresh();
+};
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
